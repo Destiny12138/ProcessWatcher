@@ -10,8 +10,8 @@ let BLACKLIST: [String] = [
 ]
 
 let LOG_PATH = NSHomeDirectory() + "/Library/Logs/ProcessMonitor.log"
-let MAX_LOG_SIZE: UInt64 = 100_000    // 100KB，日志量不大，足够追溯近期记录
-let MAX_LOG_LINES = 2000              // 行数兜底上限，主要按大小限制
+let MAX_LOG_SIZE: UInt64 = 1_000_000  // 1MB，后续可能记录更多内容，够用
+let MAX_LOG_LINES = 20_000            // 行数兜底上限，主要按大小限制
 
 var alertCache: [String: TimeInterval] = [:]
 
@@ -122,16 +122,9 @@ func sendNotification(message: String) {
 }
 
 // MARK: - 5. AppDelegate
-class AppDelegate: NSObject, NSApplicationDelegate {
-    static var shared: AppDelegate?
-
-    override init() {
-        super.init()
-        Self.shared = self
-    }
-
+class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
+    @Published var isPaused = false
     var timer: DispatchSourceTimer?
-    var isPaused = false
     var logWindowController: NSWindowController?
 
     func applicationWillFinishLaunching(_ notification: Notification) {
@@ -214,7 +207,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     func startScanTimer() {
         let queue = DispatchQueue.global(qos: .background)
         timer = DispatchSource.makeTimerSource(queue: queue)
-        timer?.schedule(deadline: .now(), repeating: .seconds(60), leeway: .seconds(10))
+        timer?.schedule(deadline: .now(), repeating: .seconds(10), leeway: .seconds(5))
         timer?.setEventHandler { [weak self] in
             guard let self = self, !self.isPaused else { return }
             scanProcesses()
@@ -240,24 +233,21 @@ struct LogView: View {
 
 // MARK: - 7. 菜单栏视图
 struct MenuBarView: View {
-    private var delegate: AppDelegate? {
-        AppDelegate.shared ?? NSApp.delegate as? AppDelegate
-    }
+    @ObservedObject var delegate: AppDelegate
     
     var body: some View {
         Button("📋 查看日志") {
             DispatchQueue.main.async {
-                delegate?.showLogWindow()
+                delegate.showLogWindow()
             }
         }
-        Button(delegate?.isPaused == true ? "▶️ 恢复监控" : "⏸️ 暂停监控") {
-            guard let delegate else { return }
+        Button(delegate.isPaused ? "▶️ 恢复监控" : "⏸️ 暂停监控") {
             delegate.setPaused(!delegate.isPaused)
         }
         Divider()
         Button("退出") {
             DispatchQueue.main.async {
-                delegate?.quitApp()
+                delegate.quitApp()
             }
         }
         .keyboardShortcut("q")
@@ -271,7 +261,7 @@ struct ProcessWatcherApp: App {
     
     var body: some Scene {
         MenuBarExtra {
-            MenuBarView()
+            MenuBarView(delegate: delegate)
         } label: {
             Text("🛡️")
         }
