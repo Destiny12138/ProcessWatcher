@@ -159,19 +159,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
     }
 
     func showLogWindow() {
-        // 读取日志内容，空日志也照常弹出
-        let logContent: String
-        if let content = try? String(contentsOfFile: LOG_PATH, encoding: .utf8), !content.isEmpty {
-            logContent = content
-        } else {
-            logContent = "日志为空"
-        }
-
-        // 窗口已存在时复用并刷新内容，不重复创建
+        // 窗口已存在时直接前置显示，保留其自动刷新状态
         if let windowController = logWindowController, let window = windowController.window {
-            if let hostingController = window.contentViewController as? NSHostingController<LogView> {
-                hostingController.rootView = LogView(content: logContent)
-            }
             NSApp.activate(ignoringOtherApps: true)
             window.makeKeyAndOrderFront(nil)
             window.orderFrontRegardless()
@@ -179,7 +168,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
         }
         
         // 创建 SwiftUI 视图作为日志显示
-        let logView = LogView(content: logContent)
+        let logView = LogView()
         let hostingController = NSHostingController(rootView: logView)
         let window = NSWindow(contentViewController: hostingController)
         window.title = "进程监控日志"
@@ -222,16 +211,62 @@ class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
 
 // MARK: - 6. SwiftUI 日志显示视图
 struct LogView: View {
-    let content: String
-    
+    @State private var content: String = "日志为空"
+    @State private var autoRefresh: Bool = true
+    private let refreshTimer = Timer.publish(every: 3, on: .main, in: .common).autoconnect()
+
     var body: some View {
-        ScrollView {
-            Text(content)
-                .font(.system(.body, design: .monospaced))
-                .padding()
-                .frame(maxWidth: .infinity, alignment: .leading)
+        VStack(spacing: 0) {
+            HStack {
+                Text("进程监控日志")
+                    .font(.headline)
+                Spacer()
+                Toggle("自动刷新", isOn: $autoRefresh)
+                    .toggleStyle(.checkbox)
+                Button("刷新") {
+                    reloadLog()
+                }
+                .help("立即重新读取日志")
+                Button("清理日志") {
+                    clearLog()
+                }
+                .help("删除全部日志")
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 6)
+
+            Divider()
+
+            ScrollView {
+                Text(content.isEmpty ? "日志为空" : content)
+                    .font(.system(.body, design: .monospaced))
+                    .padding()
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .textSelection(.enabled)
+            }
         }
-        .frame(minWidth: 400, minHeight: 300)
+        .frame(minWidth: 520, minHeight: 400)
+        .onAppear {
+            reloadLog()
+        }
+        .onReceive(refreshTimer) { _ in
+            if autoRefresh {
+                reloadLog()
+            }
+        }
+    }
+
+    private func reloadLog() {
+        if let text = try? String(contentsOfFile: LOG_PATH, encoding: .utf8), !text.isEmpty {
+            content = text
+        } else {
+            content = "日志为空"
+        }
+    }
+
+    private func clearLog() {
+        try? "".write(toFile: LOG_PATH, atomically: true, encoding: .utf8)
+        content = "日志为空"
     }
 }
 
