@@ -112,51 +112,42 @@ func sendNotification(message: String) {
 
 // MARK: - 5. AppDelegate
 class AppDelegate: NSObject, NSApplicationDelegate {
-    var statusItem: NSStatusItem?
     var timer: DispatchSourceTimer?
     var isPaused = false
     var logWindowController: NSWindowController?
+
+    func applicationWillFinishLaunching(_ notification: Notification) {
+        // 纯菜单栏应用：不在 Dock 显示
+        NSApp.setActivationPolicy(.accessory)
+    }
 
     func applicationDidFinishLaunching(_ aNotification: Notification) {
         // 请求通知权限
         UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
         
-        // 创建菜单栏图标
-        statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-        if let button = statusItem?.button {
-            button.title = "🛡️"
-            button.font = NSFont.systemFont(ofSize: 14)
-        }
-        
-        // 构建菜单
-        let menu = NSMenu()
-        menu.addItem(NSMenuItem(title: "📋 查看日志", action: #selector(showLogWindow), keyEquivalent: "l"))
-        menu.addItem(NSMenuItem.separator())
-        let toggleItem = NSMenuItem(title: "⏸️ 暂停监控", action: #selector(togglePause), keyEquivalent: "s")
-        toggleItem.state = .off
-        menu.addItem(toggleItem)
-        menu.addItem(NSMenuItem.separator())
-        menu.addItem(NSMenuItem(title: "退出", action: #selector(quitApp), keyEquivalent: "q"))
-        statusItem?.menu = menu
-        
         // 启动定时器
         startScanTimer()
-        scanProcesses()
+        
+        // 首次扫描放到后台队列，避免阻塞主线程
+        DispatchQueue.global(qos: .background).async {
+            scanProcesses()
+        }
     }
-    
-    @objc func togglePause(sender: NSMenuItem) {
-        isPaused.toggle()
-        sender.title = isPaused ? "▶️ 恢复监控" : "⏸️ 暂停监控"
+
+    func setPaused(_ paused: Bool) {
+        guard isPaused != paused else { return }
+        isPaused = paused
         if isPaused {
             timer?.suspend()
         } else {
             timer?.resume()
         }
     }
-    
-    @objc func showLogWindow() {
+
+    func showLogWindow() {
         // 如果窗口已存在，则前置显示
         if let windowController = logWindowController, let window = windowController.window, window.isVisible {
+            NSApp.activate(ignoringOtherApps: true)
             window.makeKeyAndOrderFront(nil)
             return
         }
@@ -180,14 +171,22 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         
         let windowController = NSWindowController(window: window)
         self.logWindowController = windowController
+        NSApp.activate(ignoringOtherApps: true)
         windowController.showWindow(nil)
     }
-    
-    @objc func quitApp() {
-        timer?.cancel()
-        NSApplication.shared.terminate(nil)
+
+    func quitApp() {
+        NSApp.terminate(nil)
     }
-    
+
+    func applicationWillTerminate(_ notification: Notification) {
+        // 若定时器处于挂起状态，先恢复再取消，避免清理不彻底
+        if isPaused {
+            timer?.resume()
+        }
+        timer?.cancel()
+    }
+
     func startScanTimer() {
         let queue = DispatchQueue.global(qos: .background)
         timer = DispatchSource.makeTimerSource(queue: queue)
@@ -215,14 +214,39 @@ struct LogView: View {
     }
 }
 
-// MARK: - 7. App 入口
+// MARK: - 7. 菜单栏视图
+struct MenuBarView: View {
+    private var delegate: AppDelegate? {
+        NSApp.delegate as? AppDelegate
+    }
+    
+    var body: some View {
+        Button("📋 查看日志") {
+            delegate?.showLogWindow()
+        }
+        Button(delegate?.isPaused == true ? "▶️ 恢复监控" : "⏸️ 暂停监控") {
+            guard let delegate else { return }
+            delegate.setPaused(!delegate.isPaused)
+        }
+        Divider()
+        Button("退出") {
+            delegate?.quitApp()
+        }
+        .keyboardShortcut("q")
+    }
+}
+
+// MARK: - 8. App 入口（菜单栏应用，不在 Dock 显示）
 @main
 struct ProcessWatcherApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) var delegate
     
     var body: some Scene {
-        Settings {
-            EmptyView()
+        MenuBarExtra {
+            MenuBarView()
+        } label: {
+            Text("🛡️")
         }
+        .menuBarExtraStyle(.menu)
     }
 }
