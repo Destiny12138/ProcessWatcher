@@ -6,7 +6,8 @@ import UserNotifications
 let BLACKLIST: [String] = [
     "zerotier", "tailscale", "ngrok", "frpc", "frps",
     "npc", "nps", "clash", "v2ray", "trojan",
-    "gost", "brook", "mtunnel", "proxifier", "openvpn"
+    "gost", "brook", "mtunnel", "proxifier", "openvpn",
+    "v2rayu", "mihomo", "verge"
 ]
 
 let LOG_PATH = NSHomeDirectory() + "/Library/Logs/ProcessMonitor.log"
@@ -14,6 +15,7 @@ let MAX_LOG_SIZE: UInt64 = 1_000_000  // 1MB，后续可能记录更多内容，
 let MAX_LOG_LINES = 20_000            // 行数兜底上限，主要按大小限制
 
 var alertCache: [String: TimeInterval] = [:]
+let alertCacheLock = NSLock()
 
 // MARK: - 2. 核心扫描函数
 func scanProcesses() {
@@ -106,16 +108,22 @@ func sendNotification(message: String) {
     guard let pidRange = message.range(of: "PID: \\d+", options: .regularExpression) else { return }
     let key = String(message[pidRange])
     let now = Date().timeIntervalSince1970
-    
+
+    alertCacheLock.lock()
     if let last = alertCache[key], (now - last) < 300 {
+        alertCacheLock.unlock()
         return
     }
     alertCache[key] = now
-    
+    alertCacheLock.unlock()
+
     let content = UNMutableNotificationContent()
     content.title = "🚨 内网穿透进程监控"
     content.body = message.components(separatedBy: "⚠️").last?.trimmingCharacters(in: .whitespaces) ?? message
     content.sound = .default
+    if #available(macOS 12.0, *) {
+        content.interruptionLevel = .timeSensitive
+    }
     
     let request = UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil)
     UNUserNotificationCenter.current().add(request, withCompletionHandler: nil)
@@ -136,13 +144,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
         // 请求通知权限
         UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
         
-        // 启动定时器
+        // 启动定时器（定时器会在立即触发一次并随后每 10 秒扫描）
         startScanTimer()
-        
-        // 首次扫描放到后台队列，避免阻塞主线程
-        DispatchQueue.global(qos: .background).async {
-            scanProcesses()
-        }
     }
 
     func setPaused(_ paused: Bool) {
@@ -205,7 +208,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
     }
 
     func startScanTimer() {
-        let queue = DispatchQueue.global(qos: .background)
+        // 串行队列，避免多次扫描并发导致共享状态竞争
+        let queue = DispatchQueue(label: "process.watcher.scan", qos: .background)
         timer = DispatchSource.makeTimerSource(queue: queue)
         timer?.schedule(deadline: .now(), repeating: .seconds(10), leeway: .seconds(5))
         timer?.setEventHandler { [weak self] in
