@@ -1,6 +1,9 @@
 import SwiftUI
 import Cocoa
 import UserNotifications
+import CoreWLAN
+import SystemConfiguration
+import CoreLocation
 
 // MARK: - 1. 配置
 let BLACKLIST: [String] = [
@@ -129,11 +132,92 @@ func sendNotification(message: String) {
     UNUserNotificationCenter.current().add(request, withCompletionHandler: nil)
 }
 
-// MARK: - 5. AppDelegate
+// MARK: - 5. WiFi 监听（基于 SCDynamicStore 触发器，非轮询）
+class WiFiMonitor: NSObject, CLLocationManagerDelegate {
+    static let companySSID = "H6886"
+
+    private var store: SCDynamicStore?
+    private var runLoopSource: CFRunLoopSource?
+    private let wifiClient = CWWiFiClient.shared()
+    private let locationManager = CLLocationManager()
+    private var lastSSID: String?
+
+    /// WiFi 状态变化回调（ssid, 上次是否公司WiFi, 当前是否公司WiFi）
+    var onWiFiChange: ((_ ssid: String?, _ wasCompany: Bool, _ isCompany: Bool) -> Void)?
+
+    func start() {
+        locationManager.delegate = self
+        locationManager.requestWhenInUseAuthorization()
+        setupStore()
+    }
+
+    func stop() {
+        if let source = runLoopSource {
+            CFRunLoopRemoveSource(CFRunLoopGetMain(), source, .commonModes)
+        }
+        runLoopSource = nil
+        store = nil
+    }
+
+    private func setupStore() {
+        guard let wifiInterface = wifiClient.interface() else { return }
+        let wifiKey = "State:/Network/Interface/\(wifiInterface.interfaceName)/WiFi"
+
+        var context = SCDynamicStoreContext(
+            version: 0,
+            info: Unmanaged.passUnretained(self).toOpaque(),
+            retain: nil,
+            release: nil,
+            copyDescription: nil
+        )
+        guard let store = SCDynamicStoreCreate(nil, "ProcessWatcherWiFi" as CFString, wifiStoreCallback, &context) else { return }
+        self.store = store
+
+        let keys = [wifiKey as CFString] as CFArray
+        SCDynamicStoreSetNotificationKeys(store, keys, nil)
+
+        let source = SCDynamicStoreCreateRunLoopSource(nil, store, 0)
+        runLoopSource = source
+        CFRunLoopAddSource(CFRunLoopGetMain(), source, .commonModes)
+
+        // 先读一次当前状态
+        handleWiFiChange()
+    }
+
+    func locationManagerDidChangeAuthorization(_ manager: CLLocationManager) {
+        if manager.authorizationStatus == .authorized || manager.authorizationStatus == .authorizedAlways {
+            handleWiFiChange()
+        } else if manager.authorizationStatus == .denied {
+            logToFile("[\(Date())] 📶 未获得位置权限，无法识别公司WiFi H6886")
+        }
+    }
+
+    func handleWiFiChange() {
+        let ssid = currentSSID()
+        let wasCompany = lastSSID?.caseInsensitiveCompare(Self.companySSID) == .orderedSame
+        let isCompany = ssid?.caseInsensitiveCompare(Self.companySSID) == .orderedSame
+        lastSSID = ssid
+        onWiFiChange?(ssid, wasCompany, isCompany)
+    }
+
+    private func currentSSID() -> String? {
+        wifiClient.interface()?.ssid()
+    }
+}
+
+private func wifiStoreCallback(_ store: SCDynamicStore, _ changedKeys: CFArray?, _ info: UnsafeMutableRawPointer?) {
+    guard let info = info else { return }
+    let monitor = Unmanaged<WiFiMonitor>.fromOpaque(info).takeUnretainedValue()
+    monitor.handleWiFiChange()
+}
+
+// MARK: - 6. AppDelegate
 class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
     @Published var isPaused = false
+    @Published var isOnCompanyWiFi = false
     var timer: DispatchSourceTimer?
     var logWindowController: NSWindowController?
+    let wifiMonitor = WiFiMonitor()
 
     func applicationWillFinishLaunching(_ notification: Notification) {
         // 纯菜单栏应用：不在 Dock 显示
@@ -144,8 +228,27 @@ class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
         // 请求通知权限
         UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
         
+        // WiFi 监听：连上公司WiFi自动开启监控（接入状态变化用 SCDynamicStore 推送）
+        wifiMonitor.onWiFiChange = { [weak self] ssid, wasCompany, isCompany in
+            guard let self = self else { return }
+            self.handleWiFiChange(ssid: ssid, wasCompany: wasCompany, isCompany: isCompany)
+        }
+        wifiMonitor.start()
+        
         // 启动定时器（定时器会在立即触发一次并随后每 10 秒扫描）
         startScanTimer()
+    }
+
+    func handleWiFiChange(ssid: String?, wasCompany: Bool, isCompany: Bool) {
+        isOnCompanyWiFi = isCompany
+        if isCompany && !wasCompany {
+            logToFile("[\(Date())] 📶 已连接公司 WiFi (\(WiFiMonitor.companySSID))，监控已自动开启")
+            if isPaused {
+                setPaused(false)
+            }
+        } else if !isCompany && wasCompany {
+            logToFile("[\(Date())] 📶 已断开公司 WiFi (\(WiFiMonitor.companySSID))")
+        }
     }
 
     func setPaused(_ paused: Bool) {
@@ -209,7 +312,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
     }
 }
 
-// MARK: - 6. SwiftUI 日志显示视图
+// MARK: - 7. SwiftUI 日志显示视图
 struct LogView: View {
     @State private var content: String = "日志为空"
     @State private var autoRefresh: Bool = true
@@ -270,11 +373,15 @@ struct LogView: View {
     }
 }
 
-// MARK: - 7. 菜单栏视图
+// MARK: - 8. 菜单栏视图
 struct MenuBarView: View {
     @ObservedObject var delegate: AppDelegate
     
     var body: some View {
+        Button(delegate.isOnCompanyWiFi ? "🟢 已连接公司WiFi (\(WiFiMonitor.companySSID))" : "⚪ 未连接公司WiFi") {
+        }
+        .disabled(true)
+        Divider()
         Button("📋 查看日志") {
             DispatchQueue.main.async {
                 delegate.showLogWindow()
@@ -293,7 +400,7 @@ struct MenuBarView: View {
     }
 }
 
-// MARK: - 8. App 入口（菜单栏应用，不在 Dock 显示）
+// MARK: - 9. App 入口（菜单栏应用，不在 Dock 显示）
 @main
 struct ProcessWatcherApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) var delegate
