@@ -10,8 +10,8 @@ let BLACKLIST: [String] = [
 ]
 
 let LOG_PATH = NSHomeDirectory() + "/Library/Logs/ProcessMonitor.log"
-let MAX_LOG_SIZE: UInt64 = 1_000_000  // 1MB
-let MAX_LOG_LINES = 1000              // 保留最近1000行
+let MAX_LOG_SIZE: UInt64 = 100_000    // 100KB，日志量不大，足够追溯近期记录
+let MAX_LOG_LINES = 2000              // 行数兜底上限，主要按大小限制
 
 var alertCache: [String: TimeInterval] = [:]
 
@@ -81,11 +81,22 @@ func truncateLogIfNeeded() {
     
     // 读取文件内容，按行分割
     guard let content = try? String(contentsOfFile: LOG_PATH, encoding: .utf8) else { return }
-    let lines = content.components(separatedBy: .newlines)
+    var lines = content.components(separatedBy: .newlines)
+    if lines.last?.isEmpty == true { lines.removeLast() }
     
-    // 保留最后 MAX_LOG_LINES 行
-    let keepLines = lines.suffix(MAX_LOG_LINES)
-    let newContent = keepLines.joined(separator: "\n")
+    // 从最新往前保留，保证写入内容不超过大小上限（不做时间限制）
+    var kept: [String] = []
+    var byteCount = 0
+    for line in lines.reversed() {
+        let lineBytes = line.utf8.count + 1
+        if kept.count >= MAX_LOG_LINES || byteCount + lineBytes > Int(MAX_LOG_SIZE) {
+            break
+        }
+        kept.append(line)
+        byteCount += lineBytes
+    }
+    
+    let newContent = kept.reversed().joined(separator: "\n")
     
     try? newContent.write(toFile: LOG_PATH, atomically: true, encoding: .utf8)
 }
@@ -112,6 +123,13 @@ func sendNotification(message: String) {
 
 // MARK: - 5. AppDelegate
 class AppDelegate: NSObject, NSApplicationDelegate {
+    static var shared: AppDelegate?
+
+    override init() {
+        super.init()
+        Self.shared = self
+    }
+
     var timer: DispatchSourceTimer?
     var isPaused = false
     var logWindowController: NSWindowController?
@@ -145,19 +163,23 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func showLogWindow() {
-        // 如果窗口已存在，则前置显示
-        if let windowController = logWindowController, let window = windowController.window, window.isVisible {
-            NSApp.activate(ignoringOtherApps: true)
-            window.makeKeyAndOrderFront(nil)
-            return
-        }
-        
-        // 读取日志内容
+        // 读取日志内容，空日志也照常弹出
         let logContent: String
         if let content = try? String(contentsOfFile: LOG_PATH, encoding: .utf8), !content.isEmpty {
             logContent = content
         } else {
             logContent = "日志为空"
+        }
+
+        // 窗口已存在时复用并刷新内容，不重复创建
+        if let windowController = logWindowController, let window = windowController.window {
+            if let hostingController = window.contentViewController as? NSHostingController<LogView> {
+                hostingController.rootView = LogView(content: logContent)
+            }
+            NSApp.activate(ignoringOtherApps: true)
+            window.makeKeyAndOrderFront(nil)
+            window.orderFrontRegardless()
+            return
         }
         
         // 创建 SwiftUI 视图作为日志显示
@@ -173,6 +195,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         self.logWindowController = windowController
         NSApp.activate(ignoringOtherApps: true)
         windowController.showWindow(nil)
+        window.makeKeyAndOrderFront(nil)
+        window.orderFrontRegardless()
     }
 
     func quitApp() {
@@ -217,12 +241,14 @@ struct LogView: View {
 // MARK: - 7. 菜单栏视图
 struct MenuBarView: View {
     private var delegate: AppDelegate? {
-        NSApp.delegate as? AppDelegate
+        AppDelegate.shared ?? NSApp.delegate as? AppDelegate
     }
     
     var body: some View {
         Button("📋 查看日志") {
-            delegate?.showLogWindow()
+            DispatchQueue.main.async {
+                delegate?.showLogWindow()
+            }
         }
         Button(delegate?.isPaused == true ? "▶️ 恢复监控" : "⏸️ 暂停监控") {
             guard let delegate else { return }
@@ -230,7 +256,9 @@ struct MenuBarView: View {
         }
         Divider()
         Button("退出") {
-            delegate?.quitApp()
+            DispatchQueue.main.async {
+                delegate?.quitApp()
+            }
         }
         .keyboardShortcut("q")
     }
